@@ -16,7 +16,7 @@ An evidence-grounded audit decision-support module built from the attached proje
 - Scoping Mode requires a RAU ID and uses it as the primary retrieval filter. Client and control narrow retrieval when supplied; audit is optional context so precedent can come from other audits. It groups issues by control + attribute + root cause, shows an explicit two-year lookback and older excluded issues, and requires a reason for each auditor decision.
 - OIDC sign-in in production mode. The local demo selector is disabled when `APP_ENV=production`.
 
-Product and agent guidance live in [`docs/product_spec.md`](docs/product_spec.md), [`docs/system_prompt.md`](docs/system_prompt.md), and [`AGENTS.md`](AGENTS.md). The triage graph loads its system prompt from the prompt document, inserting the current severity rubric and root-cause taxonomy at runtime.
+Project skills and agent guidance live in [`SKILLS.md`](SKILLS.md), [`AGENTS.md`](AGENTS.md), [`docs/product_spec.md`](docs/product_spec.md), and [`docs/system_prompt.md`](docs/system_prompt.md). The triage graph loads its system prompt from the prompt document, inserting the current severity rubric and root-cause taxonomy at runtime.
 
 ## Local setup
 
