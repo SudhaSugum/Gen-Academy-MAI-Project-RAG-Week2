@@ -1,26 +1,41 @@
-# Issue Triage Assistant — V1
+# Issue Triage Assistant - V1 concept
 
-An evidence-grounded audit decision-support module built from the attached project plan. V1 includes single-issue triage and RAU Scoping Mode. The same LangGraph workflow owns retrieval, recommendation, citation validation, and the human approval pause. This build uses synthetic clients, issues, controls, and policies only.
+An evidence-grounded decision-support app for internal auditors. An auditor enters a newly observed issue; the app retrieves similar synthetic past issues, relevant controls, and policy passages; then drafts source-linked suggestions for review. The auditor owns severity and disposition. **This concept build uses synthetic data only.**
 
-## Included in V1
+## Product idea
 
-- 60 labelled synthetic past issues, 36 synthetic control Word documents, and 5 synthetic policy PDFs. `scripts/generate_synthetic_data.py` deterministically generates these from the synthetic CSV/Markdown source definitions.
-- Three Pinecone namespaces: `past_issues`, `controls`, and `policies`. Retrieval applies client/audit metadata filters before ranking and combines Pinecone semantic results with local BM25 keyword results using Reciprocal Rank Fusion (RRF).
-- Controls are extracted from `.docx`; policies are extracted from `.pdf` and section-chunked with overlap; past issues remain in CSV. The PDF/Word text is the actual indexed and cited source text.
-- Retrieval cards show semantic score, BM25 keyword score, and RRF score separately. RRF scores express ranking only, not confidence or probability. Weak retrieval screening uses calibrated semantic and keyword-overlap thresholds.
-- The triage form pairs `synthetic-client-a` with `synthetic-audit-iam-2026` and `synthetic-client-b` with `synthetic-audit-finance-2026` so tenant/audit filters address an existing corpus partition.
-- Structured LangChain output, a versioned severity rubric/root-cause taxonomy, and deterministic citation checks for retrieved chunk IDs and verbatim quotes. One repair attempt is allowed; failed validation routes to Insufficient evidence.
-- Durable LangGraph approval interrupt. Pending reviews can be loaded after an app restart. Rejection requires a reason; an edited recommendation is validated again before it is recorded.
-- SQL audit tables for issues, triage runs, approvals, scoping packs, and per-cluster decisions. SQLite blocks update/delete of the append-only audit tables; Postgres is supported for hosted deployments.
-- Optional Mem0 recall scoped to auditor + client. Only a compact pattern derived from an approved or edited suggestion can be written; raw issues, source chunks, and unapproved drafts are never sent to Mem0.
-- Scoping Mode requires a RAU ID and uses it as the primary retrieval filter. Client and control narrow retrieval when supplied; audit is optional context so precedent can come from other audits. It groups issues by control + attribute + root cause, shows an explicit two-year lookback and older excluded issues, and requires a reason for each auditor decision.
-- OIDC sign-in in production mode. The local demo selector is disabled when `APP_ENV=production`.
+Today the same condition can be recorded in different words, severity and control mapping can vary, useful remediation precedent is hard to locate, and reviewers may not be able to check the basis of a recommendation. The assistant uses hybrid retrieval to surface precedent, shows duplicate candidates before an issue is created, and ties each supported suggestion to its source text.
 
-Project skills and agent guidance live in [`SKILLS.md`](SKILLS.md), [`AGENTS.md`](AGENTS.md), [`docs/product_spec.md`](docs/product_spec.md), and [`docs/system_prompt.md`](docs/system_prompt.md). The triage graph loads its system prompt from the prompt document, inserting the current severity rubric and root-cause taxonomy at runtime.
+The assistant suggests; the auditor decides. It does not auto-approve, close, create, file, or update issues in an external system. Retrieval weakness is not an evidence-sufficiency judgement.
+
+## Current user experience
+
+- **Single-issue triage:** Enter a title and description, choose a synthetic client and audit, and optionally provide audit context or a control hint. Duplicate screening uses the selected client and exact audit. Similar precedent can come from other audits for that client. A control hint is a search hint, not proof.
+- **Draft output:** Suggested severity (Critical, High, Medium, Low), root-cause category, mapped control, duplicate warning, up to five similar past issues and outcomes, remediation steps with generic owner roles and supported due-date suggestions, confidence, retrieval state, and citations.
+- **Human decision:** Approve, edit, or reject a grounded draft. Rejection requires a reason; edits are citation-validated again. Decision and reviewer details are saved to the local SQL audit store. No external issue is filed or closed.
+- **Approved draft history:** Approved and edited drafts are listed by issue title. Opening a title shows the original issue input, final suggestion, citations, similar issues, retrieval context, and decision details.
+- **Run chat:** A continuous, scrollable, per-run chat answers questions using only the sources retrieved for that triage or scoping run. It cites factual claims and cannot change the suggestion or record an auditor decision.
+- **RAU scoping:** Requires a synthetic client and RAU ID. Optional audit, control, period, RAU name, and attributes refine the search. Retrieval groups precedent by control, attribute, and root cause across audits, applies a two-year issue lookback, and shows older excluded records. A recognized year in the audit period limits issue, control, and policy retrieval to matching client audit IDs. Each cluster waits for an auditor decision and reason.
+
+## Architecture
+
+- **Streamlit** provides the intake, scoping, source review, chat, decision, and approved-draft interfaces.
+- **LangChain** formats prompts and parses structured model output.
+- **LangGraph** coordinates retrieval, drafting, citation validation/repair, and the durable human review pause. Scoping uses an explicit graph as well; there is no multi-agent swarm.
+- **Pinecone** stores three namespaces: `past_issues`, `controls`, and `policies`.
+- **Hybrid retrieval** combines Pinecone semantic search with BM25 keyword search over the small local synthetic corpus using Reciprocal Rank Fusion (RRF). Metadata filters are applied before ranking. UI semantic, BM25, overlap, and RRF values are retrieval diagnostics, not confidence probabilities.
+- **SQLAlchemy** stores triage and scoping records, review decisions, retrieved snapshots, and audit events. SQLite is for local learning; Postgres is available in the hosted deployment scaffold.
+- **Optional Mem0** recalls and stores only concise, approved/corrected patterns scoped to auditor and synthetic client. Memory is not a citation and never receives raw issues, evidence chunks, or unapproved drafts.
+
+## Data and citations
+
+The deterministic generator creates 60 synthetic past issues, 36 synthetic control Word documents, and five synthetic policy PDFs from source definitions. CSV/Markdown source definitions are generation inputs; the extracted Word/PDF text is indexed and cited. The ingestion command creates/upserts chunks in the Pinecone namespaces.
+
+Every supported suggestion claim must reference a retrieved source ID, chunk ID, and verbatim quote. The validator checks retrieval membership, source identity/type where required, and exact quote matching, with one repair attempt. A failed citation check or weak retrieval produces an explicit **Insufficient evidence** state and does not route a grounded recommendation for review. Exact-quote matching confirms the text exists in the cited chunk; it does not prove semantic support, which the auditor must judge.
 
 ## Local setup
 
-Requires Python 3.11–3.13.
+Requires Python 3.11-3.13.
 
 ```bash
 python3.11 -m venv .venv
@@ -29,7 +44,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Set `OPENAI_API_KEY` and `PINECONE_API_KEY` in `.env`. `MEM0_API_KEY` is optional; without it, the graph logs that memory was unavailable and continues. Then create the Pinecone index and load the synthetic corpus:
+Set `OPENAI_API_KEY` and `PINECONE_API_KEY` in `.env`. `MEM0_API_KEY` is optional. Configure the Pinecone index according to `.env.example`, then generate and ingest the synthetic corpus:
 
 ```bash
 python scripts/generate_synthetic_data.py
@@ -37,44 +52,36 @@ python -m src.issue_triage.ingestion.cli_ingest
 streamlit run app.py
 ```
 
-The index contract is cosine similarity, `text-embedding-3-small`, 1,536 dimensions, AWS `us-east-1` by default. The ingestion command checks an existing index dimension and stops on a mismatch. A regular ingestion upserts the current synthetic source chunks; `--rebuild` deletes all three configured namespaces and should only be used for the dedicated concept index.
+The default embedding contract is cosine similarity with `text-embedding-3-small` at 1,536 dimensions. The index has separate namespaces for issues, controls, and policies. A regular ingest upserts the synthetic chunks. `--rebuild` deletes the configured namespaces and should only be used with the dedicated concept index.
 
-## Hosted deployment scaffold
+## Hosted scaffold and readiness limits
 
-The Docker Compose configuration starts a private Postgres service and binds Streamlit only to loopback (`127.0.0.1:8501`) for a trusted reverse proxy. Provide `.env` values from a secret manager, including an URL-safe `DB_PASSWORD`, provider keys, and a real OIDC configuration mounted at `.streamlit/secrets.toml`. The example template is `.streamlit/secrets.example.toml`. Configure HTTPS, the OIDC redirect URI, network egress to approved model/vector services, backups, monitoring, and managed database encryption at rest in the host environment.
+Docker Compose provides a private Postgres service and binds Streamlit to loopback for a trusted reverse proxy. Hosted configuration requires deployment-managed secrets, HTTPS, OIDC, provider network access, backups, monitoring, and database encryption. Direct dependencies are pinned, but the repository does not contain a fully resolved platform-specific transitive lock.
 
-```bash
-docker compose up --build
-```
-
-`pyproject.toml` and `requirements.txt` pin the direct application dependencies. Generate and commit a complete platform-specific transitive lock (for example `uv.lock`) before release; this workspace does not include a resolved lock yet.
+This is **not ready for real client information**. Before that, implement and verify identity-to-client/audit authorization on every query and record read/write path; complete privacy, retention, security, backup, and operational reviews; create a resolved dependency lock; and independently evaluate retrieval thresholds, severity calibration, prompt behavior, and citation relevance using approved labeled data. OIDC sign-in alone does not provide tenant authorization.
 
 ## Configuration
 
-See `.env.example`. Important settings:
+See `.env.example`. Common settings include:
 
 | Setting | Purpose |
 | --- | --- |
-| `DATABASE_URL` | SQLAlchemy URL; SQLite locally, Postgres when hosted |
-| `CHECKPOINT_BACKEND` | `sqlite` locally or `postgres` when hosted |
-| `CHECKPOINT_DATABASE_URL` | Durable graph checkpoint connection |
-| `PINECONE_INDEX` | One index for the selected embedding model/dimension |
-| `RETRIEVAL_THRESHOLD` | Semantic weak-retrieval screening threshold (initial concept calibration) |
-| `KEYWORD_OVERLAP_THRESHOLD` | Minimum fraction of distinct query terms matched for a keyword-only retrieval signal (default `0.12`) |
-| `PROMPT_VERSION` | Prompt identifier recorded in each run |
-| `LANGGRAPH_STRICT_MSGPACK` | Restricts checkpoint deserialization to safe types |
+| `DATABASE_URL` | SQLAlchemy database URL; SQLite locally, Postgres when hosted |
+| `CHECKPOINT_BACKEND` | Durable workflow checkpoint backend |
+| `CHECKPOINT_DATABASE_URL` | Checkpoint database connection |
+| `PINECONE_INDEX` | Vector index for the selected embedding model and dimension |
+| `RETRIEVAL_THRESHOLD` | Initial concept semantic retrieval threshold |
+| `KEYWORD_OVERLAP_THRESHOLD` | Minimum query-term overlap for a keyword-only signal |
+| `PROMPT_VERSION` | Prompt version recorded with a run |
 
-Secrets are environment/deployment-secret values. They are not accepted in Streamlit widgets and are never written into graph state, prompts, or application logs.
+Keep credentials in environment/deployment secret storage. Do not put secrets in prompts, widgets, graph state, source files, or logs.
 
-## Product boundaries
+## Project documentation
 
-- The assistant suggests; the auditor decides. No automatic approval, closure, Jira draft, or filing exists in V1.
-- Semantic and keyword thresholds measure retrieval signals only. They are not an evidence sufficiency judgement. RRF is used to order results and is not a probability.
-- BM25 keyword retrieval reads the generated local synthetic corpus and is intended for this small concept build. A real deployment needs a tenant-filtered, synchronized lexical index alongside vector retrieval.
-- Scoping decisions are per cluster and remain auditor-owned. Older records and control-version conflicts are surfaced for review rather than silently carried forward.
-- This build has no production identity-to-tenant authorization policy or client data. OIDC authenticates hosted users, but client/audit authorization and organization-specific access rules must be configured before real tenant data is introduced.
-- Exact-quote validation proves a citation resolves to a retrieved chunk. It does not prove the quote semantically supports the conclusion; that still requires auditor review.
-- V2 MCP servers and Jira drafts, live evidence/control systems, and V3 evaluation framework are intentionally not included. V1 carries no external side effects.
+- [`docs/product_spec.md`](docs/product_spec.md): current workflows, requirements, scope, and deployment gates.
+- [`docs/system_prompt.md`](docs/system_prompt.md): model behavior, citation contract, and human-oversight instructions.
+- [`AGENTS.md`](AGENTS.md): durable implementation constraints and evidence rules for contributors.
+- [`SKILLS.md`](SKILLS.md): project architecture and learning workflow.
 
 ## Project layout
 
@@ -82,12 +89,12 @@ Secrets are environment/deployment-secret values. They are not accepted in Strea
 app.py
 src/issue_triage/
   audit_log/      SQL audit records
-  graph/          Single LangGraph workflow
-  ingestion/      DOCX/PDF/CSV loaders, chunker, and upsert CLI
+  graph/          Single-issue and scoping LangGraph workflows
+  ingestion/      CSV/DOCX/PDF loaders, chunking, and upsert CLI
   memory/         Approval-gated Mem0 adapter
-  retrieval/      Tenant-filtered Pinecone + BM25 hybrid search
-  triage/         Structured output schema and locked taxonomy
+  retrieval/      Pinecone + BM25 hybrid search
+  triage/         Structured output schema and taxonomy
   scoping.py      RAU retrieval, clustering, and action proposal
 data/synthetic/   Fictional CSV/Markdown definitions and generated DOCX/PDF sources
-data/golden/      Reserved for human-confirmed V3 evaluation labels
+data/golden/      Reserved for human-confirmed evaluation labels
 ```
