@@ -21,7 +21,7 @@ from ..audit_log.store import AuditStore
 from ..config import Settings
 from ..memory.mem0_client import ApprovedMemory
 from ..retrieval.pinecone_store import PineconeRetriever
-from ..triage.schema import Claim, SimilarIssue, TriageSuggestion, insufficient_suggestion
+from ..triage.schema import Citation, Claim, SimilarIssue, TriageSuggestion, insufficient_suggestion
 from ..triage.taxonomy import ROOT_CAUSE_CATEGORIES, SEVERITY_RUBRIC
 
 logger = logging.getLogger(__name__)
@@ -190,7 +190,7 @@ def _field_quote(field: str, source: dict[str, Any]) -> str:
 
 
 def _repair_claim_quotes(suggestion: TriageSuggestion, retrieved: dict[str, list[dict[str, Any]]]) -> int:
-    """Replace inaccurate model quotes only with field-specific verbatim source text."""
+    """Repair quotes and keep remediation actions tied to precedent or policy sources."""
     chunks = _flatten(retrieved)
     claims: list[tuple[str, Claim]] = [
         ("severity", suggestion.severity), ("root_cause", suggestion.root_cause),
@@ -205,6 +205,45 @@ def _repair_claim_quotes(suggestion: TriageSuggestion, retrieved: dict[str, list
         ])
     repaired = 0
     for field, claim in claims:
+        if claim.value.strip().casefold() == "insufficient evidence":
+            continue
+        if field.startswith("remediation[") and field.endswith(".action"):
+            valid_citations = []
+            for citation in claim.citations:
+                source = chunks.get(citation.chunk_id)
+                if not source or source["source_id"] != citation.source_id:
+                    continue
+                if source["source_type"] not in {"past_issues", "policies"}:
+                    continue
+                quote = _field_quote(field, source)
+                if not quote:
+                    continue
+                if citation.quote != quote:
+                    repaired += 1
+                citation.quote = quote
+                valid_citations.append(citation)
+            if valid_citations:
+                claim.citations = valid_citations
+                continue
+
+            # The model often reuses the control citation for both the owner and
+            # the action. Bind an unsupported action citation to the closest
+            # retrieved precedent already surfaced as a similar issue.
+            for precedent in suggestion.similar_issues:
+                source = chunks.get(precedent.chunk_id)
+                if not source or source["source_type"] != "past_issues":
+                    continue
+                quote = _field_quote(field, source)
+                if not quote:
+                    continue
+                claim.citations = [Citation(
+                    chunk_id=source["chunk_id"],
+                    source_id=source["source_id"],
+                    quote=quote,
+                )]
+                repaired += 1
+                break
+            continue
         for citation in claim.citations:
             source = chunks.get(citation.chunk_id)
             if not source or source["source_id"] != citation.source_id:
@@ -236,7 +275,7 @@ def citation_errors(suggestion: TriageSuggestion, retrieved: dict[str, list[dict
         ("confidence", suggestion.confidence, None),
     ]
     for idx, step in enumerate(suggestion.remediation_steps, 1):
-        claims.extend([(f"remediation[{idx}].action", step.action, None), (f"remediation[{idx}].owner_role", step.owner_role, None), (f"remediation[{idx}].due_date", step.due_date_suggestion, None)])
+        claims.extend([(f"remediation[{idx}].action", step.action, {"past_issues", "policies"}), (f"remediation[{idx}].owner_role", step.owner_role, {"controls"}), (f"remediation[{idx}].due_date", step.due_date_suggestion, None)])
     if len(suggestion.similar_issues) > 5:
         errors.append("similar_issues: more than five matches were returned")
     for item in suggestion.similar_issues:

@@ -12,19 +12,32 @@ from .retrieval.pinecone_store import PineconeRetriever
 
 def build_scoping_pack(
     settings: Settings, *, query: str, client_id: str = "", audit_id: str = "", rau_id: str,
-    control_ids: list[str] | None = None, attributes: list[str] | None = None, lookback_years: int = 2,
+    control_ids: list[str] | None = None, attributes: list[str] | None = None,
+    audit_period: str = "", lookback_years: int = 2,
 ) -> dict[str, Any]:
     control_ids = list(dict.fromkeys(control_ids or []))
     attributes = list(dict.fromkeys(attributes or []))
     since = (date.today() - timedelta(days=365 * lookback_years)).isoformat()
+    search_query = query
+    if audit_period.strip():
+        search_query = f"{query}\nAudit period: {audit_period.strip()}"
     retriever = PineconeRetriever(settings)
-    issues, excluded = retriever.retrieve_scoping(
-        query=query, client_id=client_id, audit_id=audit_id, rau_id=rau_id,
-        control_ids=control_ids, since=since,
+    audit_years, period_audit_ids = retriever.audit_ids_for_period(
+        client_id=client_id,
+        audit_period=audit_period,
     )
-    controls = retriever.retrieve_scope_controls(query=query, client_id=client_id, audit_id=audit_id, rau_id=rau_id, control_ids=control_ids)
-    policy_query = f"{query}; RAU {rau_id}" + (f"; controls {', '.join(control_ids)}" if control_ids else "")
-    policies = retriever.retrieve_scope_policies(query=policy_query, client_id=client_id)
+    issues, excluded = retriever.retrieve_scoping(
+        query=search_query, client_id=client_id, audit_id=audit_id, rau_id=rau_id,
+        control_ids=control_ids, since=since, period_audit_ids=period_audit_ids,
+    )
+    controls = retriever.retrieve_scope_controls(
+        query=search_query, client_id=client_id, audit_id=audit_id, rau_id=rau_id,
+        control_ids=control_ids, period_audit_ids=period_audit_ids,
+    )
+    policy_query = f"{search_query}; RAU {rau_id}" + (f"; controls {', '.join(control_ids)}" if control_ids else "")
+    policies = retriever.retrieve_scope_policies(
+        query=policy_query, client_id=client_id, period_audit_ids=period_audit_ids,
+    )
     controls_by_id: dict[str, list[dict[str, Any]]] = {}
     for item in controls:
         controls_by_id.setdefault(item["control_id"], []).append(item)
@@ -94,4 +107,10 @@ def build_scoping_pack(
             })
     rows.sort(key=lambda row: (0 if row["priority"] == "High" else 1, row["control_id"], row["attribute"]))
     citation_sources = {item["chunk_id"]: item for item in [*policies, *(row for group in controls_by_id.values() for row in group), *issues, *excluded]}
-    return {"rau_id": rau_id, "audit_period": "", "lookback_since": since, "rows": rows, "excluded_older_issues": excluded, "retrieved_control_count": sum(len(items) for items in controls_by_id.values()), "citation_sources": citation_sources, "policy_sources": policies}
+    return {
+        "rau_id": rau_id, "audit_period": audit_period, "audit_years": audit_years,
+        "audit_ids_searched": period_audit_ids, "lookback_since": since, "rows": rows,
+        "excluded_older_issues": excluded,
+        "retrieved_control_count": sum(len(items) for items in controls_by_id.values()),
+        "citation_sources": citation_sources, "policy_sources": policies,
+    }

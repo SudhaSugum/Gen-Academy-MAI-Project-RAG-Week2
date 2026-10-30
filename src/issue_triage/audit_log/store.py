@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, inspect, text
 
 
 class AuditStore:
@@ -24,7 +24,7 @@ class AuditStore:
         ddl = [
             "CREATE TABLE IF NOT EXISTS issues (issue_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, client_id TEXT NOT NULL, audit_id TEXT NOT NULL, title TEXT NOT NULL, description TEXT NOT NULL, submitted_by TEXT NOT NULL, created_at TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS triage_runs (run_id TEXT PRIMARY KEY, issue_id TEXT NOT NULL, client_id TEXT NOT NULL, audit_id TEXT NOT NULL, model TEXT NOT NULL, prompt_version TEXT NOT NULL, status TEXT NOT NULL, input_json TEXT NOT NULL, retrieved_json TEXT NOT NULL, suggestion_json TEXT, created_at TEXT NOT NULL)",
-            "CREATE TABLE IF NOT EXISTS approvals (approval_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, decision TEXT NOT NULL, edited_fields_json TEXT, reason TEXT NOT NULL, approver TEXT NOT NULL, decided_at TEXT NOT NULL)",
+            "CREATE TABLE IF NOT EXISTS approvals (approval_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, decision TEXT NOT NULL, edited_fields_json TEXT, final_suggestion_json TEXT, reason TEXT NOT NULL, approver TEXT NOT NULL, decided_at TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS scoping_runs (scope_run_id TEXT PRIMARY KEY, client_id TEXT NOT NULL, audit_id TEXT NOT NULL, rau_id TEXT NOT NULL, audit_period TEXT NOT NULL, input_json TEXT NOT NULL, pack_json TEXT NOT NULL, created_at TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS scoping_decisions (decision_id TEXT PRIMARY KEY, scope_run_id TEXT NOT NULL, cluster_id TEXT NOT NULL, decision TEXT NOT NULL, reason TEXT NOT NULL, approver TEXT NOT NULL, decided_at TEXT NOT NULL)",
             "CREATE TABLE IF NOT EXISTS audit_events (event_id TEXT PRIMARY KEY, run_id TEXT NOT NULL, event_type TEXT NOT NULL, payload_json TEXT NOT NULL, created_at TEXT NOT NULL)",
@@ -35,6 +35,9 @@ class AuditStore:
         with self.engine.begin() as conn:
             for statement in ddl:
                 conn.execute(text(statement))
+            approval_columns = {column["name"] for column in inspect(conn).get_columns("approvals")}
+            if "final_suggestion_json" not in approval_columns:
+                conn.execute(text("ALTER TABLE approvals ADD COLUMN final_suggestion_json TEXT"))
             if self.engine.dialect.name == "sqlite":
                 for table in ("issues", "triage_runs", "scoping_runs"):
                     conn.execute(text(f"CREATE TRIGGER IF NOT EXISTS {table}_no_update BEFORE UPDATE ON {table} BEGIN SELECT RAISE(ABORT, 'append-only table'); END"))
@@ -62,7 +65,7 @@ class AuditStore:
             })
 
     def save_run(self, state: dict[str, Any], model: str, prompt_version: str) -> None:
-        issue = {key: state.get(key, "") for key in ("issue_title", "issue_description", "client_id", "audit_id", "auditor_id")}
+        issue = {key: state.get(key, "") for key in ("issue_title", "issue_description", "client_id", "audit_id", "audit_context", "control_hint", "auditor_id")}
         created = datetime.now(timezone.utc).isoformat()
         status = "review_pending" if state.get("review_pending") else "insufficient_evidence"
         with self.engine.begin() as conn:
@@ -86,10 +89,15 @@ class AuditStore:
             })
 
     def record_approval(self, run_id: str, payload: dict[str, Any], suggestion: Any) -> None:
+        decision = payload["decision"]
+        suggestion_json = self._json(suggestion)
         with self.engine.begin() as conn:
-            conn.execute(text("INSERT INTO approvals VALUES (:id,:run,:decision,:edited,:reason,:approver,:created)"), {
-                "id": str(uuid.uuid4()), "run": run_id, "decision": payload["decision"],
-                "edited": self._json(suggestion) if payload["decision"] == "edit" else None,
+            conn.execute(text("""INSERT INTO approvals
+                (approval_id, run_id, decision, edited_fields_json, final_suggestion_json, reason, approver, decided_at)
+                VALUES (:id,:run,:decision,:edited,:suggestion,:reason,:approver,:created)"""), {
+                "id": str(uuid.uuid4()), "run": run_id, "decision": decision,
+                "edited": suggestion_json if decision == "edit" else None,
+                "suggestion": suggestion_json if decision in {"approve", "edit"} else None,
                 "reason": payload.get("reason", ""), "approver": payload["approver"],
                 "created": datetime.now(timezone.utc).isoformat(),
             })
@@ -98,6 +106,32 @@ class AuditStore:
         with self.engine.connect() as conn:
             rows = conn.execute(text("SELECT r.run_id, r.audit_id, r.model, COALESCE((SELECT a.decision FROM approvals a WHERE a.run_id=r.run_id ORDER BY a.decided_at DESC LIMIT 1), r.status) AS status, r.created_at FROM triage_runs r WHERE r.client_id=:client ORDER BY r.created_at DESC LIMIT :limit"), {"client": client_id, "limit": limit}).mappings().all()
             return [dict(row) for row in rows]
+
+    def approved_drafts(self, client_id: str, limit: int = 50) -> list[dict[str, Any]]:
+        """Return approved or edited suggestions with their stored evidence for review."""
+        statement = text("""SELECT a.approval_id, a.run_id, a.decision, a.reason,
+                    a.approver, a.decided_at, i.issue_id, i.title, i.description,
+                    i.submitted_by, r.client_id, r.audit_id, r.input_json,
+                    COALESCE(a.final_suggestion_json, a.edited_fields_json, r.suggestion_json) AS suggestion_json,
+                    r.retrieved_json
+                FROM approvals a
+                JOIN triage_runs r ON r.run_id=a.run_id
+                JOIN issues i ON i.issue_id=r.issue_id
+                WHERE r.client_id=:client
+                    AND a.decision IN ('approve', 'edit')
+                    AND COALESCE(a.final_suggestion_json, a.edited_fields_json, r.suggestion_json) IS NOT NULL
+                ORDER BY a.decided_at DESC
+                LIMIT :limit""")
+        with self.engine.connect() as conn:
+            rows = conn.execute(statement, {"client": client_id, "limit": limit}).mappings().all()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["input"] = json.loads(item.pop("input_json") or "{}")
+            item["suggestion"] = json.loads(item.pop("suggestion_json"))
+            item["retrieved"] = json.loads(item.pop("retrieved_json") or "{}")
+            result.append(item)
+        return result
 
     def recent_scoping_runs(self, client_id: str | None = None, limit: int = 20) -> list[dict[str, Any]]:
         with self.engine.connect() as conn:
@@ -134,7 +168,7 @@ class AuditStore:
                 return None
             details = dict(row)
             details["events"] = [dict(item) for item in conn.execute(text("SELECT event_type,payload_json,created_at FROM audit_events WHERE run_id=:run ORDER BY created_at"), {"run": run_id}).mappings().all()]
-            details["approvals"] = [dict(item) for item in conn.execute(text("SELECT decision,edited_fields_json,reason,approver,decided_at FROM approvals WHERE run_id=:run"), {"run": run_id}).mappings().all()]
+            details["approvals"] = [dict(item) for item in conn.execute(text("SELECT decision,edited_fields_json,final_suggestion_json,reason,approver,decided_at FROM approvals WHERE run_id=:run"), {"run": run_id}).mappings().all()]
             return details
 
     def save_scoping_run(self, scope_run_id: str, client_id: str, audit_id: str, rau_id: str, period: str, inputs: Any, pack: Any) -> None:

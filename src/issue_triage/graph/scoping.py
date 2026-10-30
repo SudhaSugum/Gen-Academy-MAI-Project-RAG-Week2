@@ -36,7 +36,9 @@ class ScopingState(TypedDict, total=False):
 
 def build_scoping_graph(settings: Settings):
     def retrieve_and_cluster(state: ScopingState) -> dict[str, Any]:
-        client_id = state.get("client_id", "")
+        client_id = str(state.get("client_id") or "").strip()
+        if not client_id:
+            raise ValueError("A synthetic client is required for RAU scoping retrieval.")
         audit_id = state.get("audit_id", "")
         control_ids = state.get("control_ids", [])
         attributes = state.get("attributes", [])
@@ -44,6 +46,7 @@ def build_scoping_graph(settings: Settings):
         pack = build_scoping_pack(
             settings, query=state["query"], client_id=client_id, audit_id=audit_id,
             rau_id=state["rau_id"], control_ids=control_ids, attributes=attributes,
+            audit_period=audit_period,
         )
         pack["audit_period"] = audit_period
         store = AuditStore(settings.database_url)

@@ -7,13 +7,13 @@ import logging
 import os
 import uuid
 from typing import Any
+from urllib.parse import quote
 
 import streamlit as st
 from langgraph.types import Command
 
 from src.issue_triage.audit_log.store import AuditStore
 from src.issue_triage.chatbot import answer_from_run_sources
-from src.issue_triage.chat_window import render_chat_window_controls
 from src.issue_triage.config import get_settings
 from src.issue_triage.graph.scoping import build_scoping_graph
 from src.issue_triage.graph.workflow import build_graph, citation_errors
@@ -64,7 +64,10 @@ def render_claim(label: str, claim: dict, retrieved: dict[str, dict]) -> None:
             st.error("Citation could not be resolved to a retrieved source chunk.")
             continue
         with st.expander(f"{source['ref']} · {source['title']} · {source['source_id']}"):
-            st.caption(f"Chunk: {citation['chunk_id']} · Section: {source.get('section') or 'Not specified'}")
+            st.caption(
+                f"Source audit ID: {source.get('audit_id') or 'Not recorded'} · "
+                f"Chunk: {citation['chunk_id']} · Section: {source.get('section') or 'Not specified'}"
+            )
             st.markdown(f"> {citation['quote']}")
 
 
@@ -113,130 +116,110 @@ def render_grounded_chat_reply(payload: dict, sources: dict[str, dict]) -> None:
 
 
 def render_run_chat(mode: str, run_id: str, sources: dict[str, Any] | list[dict[str, Any]], run_context: dict[str, Any]) -> None:
-    if not st.session_state.get("chat_panel_visible", True):
-        return
     panel_key = f"chat_panel_{mode}"
-    body_key = f"{panel_key}_body"
-    side = st.session_state.get("chat_panel_side", "Right")
-    panel_container = st.container(border=True, key=panel_key)
-    dock_css = {
-        "Right": "top: 5.25rem; right: 1rem; bottom: 1rem; left: auto; width: min(410px, 36vw); height: calc(100vh - 6.25rem); max-height: calc(100vh - 6.25rem);",
-        "Left": "top: 5.25rem; left: 1rem; bottom: 1rem; right: auto; width: min(410px, 36vw); height: calc(100vh - 6.25rem); max-height: calc(100vh - 6.25rem);",
-        "Top": "top: 5.25rem; left: 1rem; right: 1rem; bottom: auto; width: auto; height: min(42vh, 430px); max-height: calc(100vh - 6.25rem);",
-        "Bottom": "top: auto; left: 1rem; right: 1rem; bottom: 1rem; width: auto; height: min(42vh, 430px); max-height: calc(100vh - 6.25rem);",
+    with st.container(border=True, key=panel_key):
+        st.subheader("Ask about this run", icon=":material/chat:")
+        st.caption("Ask follow-up questions about the response above. Answers cite this run’s retrieved sources and do not change suggestions or decisions.")
+        conversations = st.session_state.setdefault("chat_conversations_by_run", {})
+        messages = conversations.setdefault(run_id, [])
+        if isinstance(sources, dict) and sources and all(isinstance(value, dict) and "chunk_id" in value for value in sources.values()):
+            source_rows = list(sources.values())
+        else:
+            source_rows = [item for group in sources.values() for item in group] if isinstance(sources, dict) else sources
+        source_map = {item["chunk_id"]: item for item in source_rows if item.get("chunk_id")}
+
+        with st.container(height=360, key=f"{panel_key}_history"):
+            for message in messages:
+                with st.chat_message(message["role"]):
+                    if message["role"] == "user":
+                        st.write(message["content"])
+                    else:
+                        render_grounded_chat_reply(message["payload"], source_map)
+
+        with st.form(f"chat_form_{mode}_{run_id}", clear_on_submit=True):
+            question = st.text_input("Your question", placeholder="Ask a follow-up about this run", key=f"chat_{mode}_{run_id}")
+            send_question = st.form_submit_button("Send", icon=":material/send:", type="primary")
+        if send_question and question.strip():
+            question = question.strip()
+            prior_history = list(messages)
+            messages.append({"role": "user", "content": question})
+            try:
+                with st.spinner("Checking this run's sources…"):
+                    reply, _ = answer_from_run_sources(
+                        settings,
+                        question=question,
+                        history=prior_history,
+                        sources=sources,
+                        run_context=run_context,
+                    )
+                payload = reply.model_dump(mode="json")
+            except Exception as exc:
+                payload = {"error": f"Chat is unavailable ({type(exc).__name__}). Your triage and review state are unchanged."}
+            messages.append({"role": "assistant", "payload": payload})
+            conversations[run_id] = messages[-50:]
+            st.rerun()
+
+
+@st.dialog("Approved issue details", width="large", icon=":material/assignment:")
+def render_approved_draft_dialog(item: dict[str, Any]) -> None:
+    st.markdown(f"### {item['title']}")
+    st.write(item["description"])
+    st.caption(
+        f"Issue {item['issue_id']} · run {item['run_id']} · {item['client_id']} · {item['audit_id']} · "
+        f"decision {item['decision']} · submitted by {item['submitted_by']} · "
+        f"approver {item['approver']} · {item['decided_at']}"
+    )
+    if item["input"].get("audit_context"):
+        st.markdown(f"**Audit context:** {item['input']['audit_context']}")
+    if item["input"].get("control_hint"):
+        st.markdown(f"**Auditor control hint:** {item['input']['control_hint']}")
+    if item.get("reason"):
+        st.markdown(f"**Decision reason:** {item['reason']}")
+
+    suggestion = TriageSuggestion.model_validate(item["suggestion"])
+    source_chunks = {
+        source["chunk_id"]: source
+        for group in item["retrieved"].values()
+        for source in group
+        if source.get("chunk_id")
     }
-    position_css = f"position: fixed; {dock_css.get(side, dock_css['Right'])}"
-    st.html(f"""
-    <style>
-      .st-key-{panel_key} {{
-        {position_css}
-        display: flex;
-        flex-direction: column;
-        overflow: hidden;
-        z-index: 10000;
-        padding: .75rem;
-        background: rgba(255,255,255,.98);
-        border: 1px solid rgba(80,95,88,.25);
-        border-radius: 14px;
-        box-shadow: 0 10px 36px rgba(20,35,28,.2);
-      }}
-      .st-key-{panel_key} > [data-testid="stVerticalBlock"] {{
-        display: flex;
-        flex-direction: column;
-        flex: 1 1 auto;
-        min-height: 0;
-        overflow: hidden;
-      }}
-      .st-key-{panel_key} .st-key-{body_key} {{
-        display: flex;
-        flex: 1 1 auto;
-        flex-direction: column;
-        min-height: 0;
-        overflow: hidden;
-      }}
-      .st-key-{panel_key} .st-key-{panel_key}_history {{
-        flex: 1 1 auto;
-        min-height: 0;
-        overflow-y: auto;
-        overscroll-behavior: contain;
-      }}
-      .st-key-{panel_key} .st-key-{panel_key}_composer {{
-        flex: 0 0 auto;
-        position: sticky;
-        bottom: 0;
-        z-index: 1;
-        padding-top: .5rem;
-        background: rgba(255,255,255,.98);
-      }}
-      @media (max-width: 760px) {{
-        .st-key-{panel_key} {{
-          left: 1rem;
-          right: 1rem;
-          width: auto;
-          max-width: none;
-          {'height: min(42vh, 430px);' if side in ('Top', 'Bottom') else ''}
-        }}
-      }}
-    </style>
-    """)
-    with panel_container:
-        render_chat_window_controls(
-            panel_key=panel_key,
-            body_key=body_key,
-            run_key=f"{mode}_{run_id}",
-            title="Issue triage chat" if mode == "triage" else "RAU scoping chat",
-            side=side,
-        )
-        with st.container(key=body_key):
-            st.markdown("### Ask about this run")
-            st.caption("Ask follow-up questions in the same conversation. Answers use this run's retrieved sources and cite factual claims; chat does not change suggestions or record decisions.")
-            conversations = st.session_state.setdefault("chat_conversations_by_run", {})
-            messages = conversations.setdefault(run_id, [])
-            if isinstance(sources, dict) and sources and all(isinstance(value, dict) and "chunk_id" in value for value in sources.values()):
-                source_rows = list(sources.values())
-            else:
-                source_rows = [item for group in sources.values() for item in group] if isinstance(sources, dict) else sources
-            source_map = {item["chunk_id"]: item for item in source_rows if item.get("chunk_id")}
-
-            history_slot = st.container(height=360, key=f"{panel_key}_history")
-            with st.container(key=f"{panel_key}_composer"):
-                question = st.chat_input(
-                    "Ask a follow-up about this run",
-                    key=f"chat_{mode}_{run_id}",
-                    submit_mode="disable",
-                )
-            if question:
-                prior_history = list(messages)
-                messages.append({"role": "user", "content": question})
-                try:
-                    with st.spinner("Checking this run's sources…"):
-                        reply, _ = answer_from_run_sources(
-                            settings,
-                            question=question,
-                            history=prior_history,
-                            sources=sources,
-                            run_context=run_context,
-                        )
-                    payload = reply.model_dump(mode="json")
-                except Exception as exc:
-                    payload = {"error": f"Chat is unavailable ({type(exc).__name__}). Your triage and review state are unchanged."}
-                messages.append({"role": "assistant", "payload": payload})
-                conversations[run_id] = messages[-50:]
-
-            with history_slot:
-                for message in conversations[run_id]:
-                    with st.chat_message(message["role"]):
-                        if message["role"] == "user":
-                            st.write(message["content"])
-                        else:
-                            render_grounded_chat_reply(message["payload"], source_map)
+    render_claim("Duplicate warning", suggestion.duplicate_warning.model_dump(), source_chunks)
+    render_claim("Suggested severity", suggestion.severity.model_dump(), source_chunks)
+    render_claim("Root-cause category", suggestion.root_cause.model_dump(), source_chunks)
+    render_claim("Mapped control ID", suggestion.control_mapping.model_dump(), source_chunks)
+    render_claim("Confidence", suggestion.confidence.model_dump(), source_chunks)
+    st.markdown("**Final remediation steps**")
+    for index, step in enumerate(suggestion.remediation_steps, 1):
+        with st.container(border=True):
+            st.markdown(f"**Step {index}**")
+            render_claim("Action", step.action.model_dump(), source_chunks)
+            render_claim("Owner role", step.owner_role.model_dump(), source_chunks)
+            render_claim("Due-date suggestion", step.due_date_suggestion.model_dump(), source_chunks)
+    if suggestion.similar_issues:
+        st.markdown("**Similar past issues**")
+        for match in suggestion.similar_issues:
+            source = source_chunks.get(match.chunk_id)
+            if source:
+                with st.container(border=True):
+                    st.markdown(f"**{source['title']}**")
+                    st.caption(
+                        f"{source.get('source_id', 'Unknown')} · audit {source.get('audit_id') or 'not recorded'} · "
+                        f"similarity {match.similarity:.3f} · {match.chunk_id}"
+                    )
+                    st.write(f"Outcome: {match.outcome or source.get('outcome') or 'Not recorded'}")
+    with st.expander("Retrieved evidence", expanded=False):
+        for source_type, label in (
+            ("duplicate_issues", "Exact-audit duplicate candidates"),
+            ("past_issues", "Similar issues from other audits"),
+            ("controls", "Controls"),
+            ("policies", "Policies"),
+        ):
+            st.markdown(f"**{label}**")
+            for source in item["retrieved"].get(source_type, []):
+                render_source_card(source)
 
 
 auditor_id = current_auditor()
-st.sidebar.subheader("Chat panel", icon=":material/chat:")
-st.sidebar.toggle("Show chat panel", value=True, key="chat_panel_visible")
-st.sidebar.caption("Choose a screen edge to dock the chat. You can still drag it to another position.")
-st.sidebar.selectbox("Dock chat panel", ["Right", "Left", "Top", "Bottom"], key="chat_panel_side")
 st.sidebar.divider()
 st.sidebar.subheader("Run history", icon=":material/history:")
 history_client = st.sidebar.selectbox("Synthetic client", ["synthetic-client-a", "synthetic-client-b"], key="triage_history_client")
@@ -254,7 +237,14 @@ if run_rows:
                 "input": json.loads(detail["input_json"]),
                 "retrieved_chunks": json.loads(detail["retrieved_json"]),
                 "suggestion": json.loads(detail["suggestion_json"]) if detail["suggestion_json"] else None,
-                "approvals": detail["approvals"],
+                "approvals": [
+                    {
+                        **approval,
+                        "edited_fields": json.loads(approval["edited_fields_json"]) if approval.get("edited_fields_json") else None,
+                        "final_suggestion": json.loads(approval["final_suggestion_json"]) if approval.get("final_suggestion_json") else None,
+                    }
+                    for approval in detail["approvals"]
+                ],
                 "events": [{"event_type": e["event_type"], "payload": json.loads(e["payload_json"]), "created_at": e["created_at"]} for e in detail["events"]],
             })
         if st.sidebar.button("Resume pending review", disabled=selected_row["status"] != "review_pending"):
@@ -297,7 +287,6 @@ st.warning(
     title="Concept environment",
     icon=":material/science:",
 )
-
 pain, outcome = st.columns(2, gap="large")
 with pain:
     with st.container(border=True):
@@ -358,92 +347,137 @@ with tab_issue:
         retrieved_rows = current.get("retrieved", {})
         chunks = {item["chunk_id"]: item for group in retrieved_rows.values() for item in group}
         st.divider()
+        chat_context = {
+            "mode": "single-issue triage",
+            "issue_title": current.get("issue_title", ""),
+            "issue_description": current.get("issue_description", ""),
+            "client_id": current.get("client_id", ""),
+            "audit_id": current.get("audit_id", ""),
+            "audit_context": current.get("audit_context", ""),
+            "control_hint": current.get("control_hint", ""),
+        }
         left, right = st.columns([1.1, .9], gap="large")
         with left:
-            st.subheader("Draft suggestion", icon=":material/assignment:")
-            st.caption(f"Run {active_review['run_id']} · Model {settings.chat_model} · Prompt {settings.prompt_version}")
-            if current.get("error"):
-                st.warning(current["error"])
-            if suggestion and current.get("review_pending"):
-                render_claim("Duplicate warning", suggestion.duplicate_warning.model_dump(), chunks)
-                render_claim("Suggested severity", suggestion.severity.model_dump(), chunks)
-                render_claim("Root-cause category", suggestion.root_cause.model_dump(), chunks)
-                render_claim("Mapped control ID", suggestion.control_mapping.model_dump(), chunks)
-                render_claim("Confidence", suggestion.confidence.model_dump(), chunks)
-                st.markdown("**Draft remediation steps**")
-                for i, step in enumerate(suggestion.remediation_steps, 1):
-                    with st.container(border=True):
-                        st.markdown(f"**Step {i}**")
-                        render_claim("Action", step.action.model_dump(), chunks)
-                        render_claim("Owner role", step.owner_role.model_dump(), chunks)
-                        render_claim("Due-date suggestion", step.due_date_suggestion.model_dump(), chunks)
-                st.markdown("#### Similar past issues")
-                for item in suggestion.similar_issues:
-                    source = chunks.get(item.chunk_id)
-                    if source:
-                        relevance = source.get("hybrid_score", 0.0)
+            with st.expander("Draft suggestion", expanded=True):
+                st.caption(f"Run {active_review['run_id']} · Model {settings.chat_model} · Prompt {settings.prompt_version}")
+                if current.get("error"):
+                    st.warning(current["error"])
+                if suggestion and current.get("review_pending"):
+                    render_claim("Duplicate warning", suggestion.duplicate_warning.model_dump(), chunks)
+                    render_claim("Suggested severity", suggestion.severity.model_dump(), chunks)
+                    render_claim("Root-cause category", suggestion.root_cause.model_dump(), chunks)
+                    render_claim("Mapped control ID", suggestion.control_mapping.model_dump(), chunks)
+                    render_claim("Confidence", suggestion.confidence.model_dump(), chunks)
+                    st.markdown("**Draft remediation steps**")
+                    for i, step in enumerate(suggestion.remediation_steps, 1):
                         with st.container(border=True):
-                            st.markdown(f"**{source['title']}**")
-                            st.caption(f"{source.get('source_id', 'Unknown')} · audit {source.get('audit_id') or 'not recorded'} · semantic {item.similarity:.3f} · hybrid {relevance:.5f} · {item.chunk_id}")
-                            st.write(f"Outcome: {item.outcome or 'Not recorded'}")
-                st.markdown("#### Auditor decision")
-                edited = st.text_area("Edit suggestion (JSON)", value=suggestion.model_dump_json(indent=2), height=300, key=f"approval_edit_{active_review['run_id']}")
-                decision = st.radio("Decision", ["approve", "edit", "reject"], horizontal=True, key=f"approval_decision_{active_review['run_id']}")
-                reason = st.text_area("Decision reason (required for rejection)", key=f"approval_reason_{active_review['run_id']}")
-                if st.button("Submit human decision", type="primary", key=f"approval_submit_{active_review['run_id']}", width="stretch"):
-                    if decision == "reject" and not reason.strip():
-                        st.error("A rejection reason is required.")
+                            st.markdown(f"**Step {i}**")
+                            render_claim("Action", step.action.model_dump(), chunks)
+                            render_claim("Owner role", step.owner_role.model_dump(), chunks)
+                            render_claim("Due-date suggestion", step.due_date_suggestion.model_dump(), chunks)
+                    st.markdown("#### Similar past issues")
+                    for item in suggestion.similar_issues:
+                        source = chunks.get(item.chunk_id)
+                        if source:
+                            relevance = source.get("hybrid_score", 0.0)
+                            with st.container(border=True):
+                                st.markdown(f"**{source['title']}**")
+                                st.caption(f"{source.get('source_id', 'Unknown')} · audit {source.get('audit_id') or 'not recorded'} · semantic {item.similarity:.3f} · hybrid {relevance:.5f} · {item.chunk_id}")
+                                st.write(f"Outcome: {item.outcome or 'Not recorded'}")
+                    st.markdown("#### Auditor decision")
+                    decision_choice = st.radio(
+                        "Decision", ["approve", "edit", "deny"], horizontal=True,
+                        key=f"approval_decision_v2_{active_review['run_id']}",
+                    )
+                    edited = suggestion.model_dump_json(indent=2)
+                    if decision_choice == "edit":
+                        edited = st.text_area(
+                            "Edit suggestion (JSON)", value=edited, height=300,
+                            key=f"approval_edit_{active_review['run_id']}",
+                        )
+                    reason = st.text_area(
+                        "Decision reason (required for denial)",
+                        key=f"approval_reason_{active_review['run_id']}",
+                    )
+                    if st.button("Submit human decision", type="primary", key=f"approval_submit_{active_review['run_id']}", width="stretch"):
+                        if decision_choice == "deny" and not reason.strip():
+                            st.error("A reason is required to deny the suggestion.")
+                        else:
+                            try:
+                                decision = "reject" if decision_choice == "deny" else decision_choice
+                                if decision_choice == "edit":
+                                    edited_suggestion = TriageSuggestion.model_validate_json(edited)
+                                    problems = citation_errors(edited_suggestion, retrieved_rows)
+                                    if problems:
+                                        raise ValueError("; ".join(problems))
+                                payload = {"decision": decision, "edited_json": edited, "reason": reason.strip(), "approver": auditor_id.strip()}
+                                build_graph(settings).invoke(Command(resume=payload), config=active_review["config"])
+                                st.session_state.pop("active_review", None)
+                                st.session_state["review_decision_notice"] = decision_choice
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Review could not be recorded: {exc}")
+                elif current.get("insufficient_evidence"):
+                    retrieval_error = current.get("error", "")
+                    if retrieval_error.startswith("Retrieval unavailable:"):
+                        st.error(retrieval_error)
                     else:
-                        try:
-                            if decision == "edit":
-                                edited_suggestion = TriageSuggestion.model_validate_json(edited)
-                                problems = citation_errors(edited_suggestion, retrieved_rows)
-                                if problems:
-                                    raise ValueError("; ".join(problems))
-                            payload = {"decision": decision, "edited_json": edited, "reason": reason.strip(), "approver": auditor_id.strip()}
-                            build_graph(settings).invoke(Command(resume=payload), config=active_review["config"])
-                            st.session_state.pop("active_review", None)
-                            st.success(f"Human decision recorded: {decision}. No issue was closed or filed.")
-                            st.rerun()
-                        except Exception as exc:
-                            st.error(f"Review could not be recorded: {exc}")
-            elif current.get("insufficient_evidence"):
-                retrieval_error = current.get("error", "")
-                if retrieval_error.startswith("Retrieval unavailable:"):
-                    st.error(retrieval_error)
-                else:
-                    reason = retrieval_error or "Retrieval did not produce a strong enough basis for a suggestion."
-                    st.error(f"Insufficient evidence — {reason} This is not an evidence sufficiency assessment.")
-            elif suggestion and current.get("review_complete"):
-                st.info("This run already has a recorded human decision. Open its audit record from Run history to inspect the decision.")
+                        reason = retrieval_error or "Retrieval did not produce a strong enough basis for a suggestion."
+                        st.error(f"Insufficient evidence — {reason} This is not an evidence sufficiency assessment.")
+                elif suggestion and current.get("review_complete"):
+                    st.info("This run already has a recorded human decision. Open its audit record from Run history to inspect the decision.")
         with right:
-            st.subheader("Retrieved sources", icon=":material/library_books:")
-            render_retrieval_legend()
-            for source_type, label in (("duplicate_issues", "Exact-audit duplicate candidates"), ("past_issues", "Similar issues from other audits"), ("controls", "Controls"), ("policies", "Policies")):
-                st.markdown(f"**{label}**")
-                for item in retrieved_rows.get(source_type, []):
-                    render_source_card(item)
-        render_run_chat(
-            "triage", active_review["run_id"], retrieved_rows,
-            {
-                "mode": "single-issue triage",
-                "issue_title": current.get("issue_title", ""),
-                "issue_description": current.get("issue_description", ""),
-                "client_id": current.get("client_id", ""),
-                "audit_id": current.get("audit_id", ""),
-                "audit_context": current.get("audit_context", ""),
-                "control_hint": current.get("control_hint", ""),
-            },
-        )
+            with st.expander("Retrieved sources", expanded=False):
+                render_retrieval_legend()
+                for source_type, label in (("duplicate_issues", "Exact-audit duplicate candidates"), ("past_issues", "Similar issues from other audits"), ("controls", "Controls"), ("policies", "Policies")):
+                    st.markdown(f"**{label}**")
+                    for item in retrieved_rows.get(source_type, []):
+                        render_source_card(item)
+        render_run_chat("triage", active_review["run_id"], retrieved_rows, chat_context)
+    decision_notice = st.session_state.pop("review_decision_notice", None)
+    if decision_notice == "deny":
+        st.warning("Suggestion denied. The denial was saved to the local audit database; no issue was closed or filed.")
+    elif decision_notice == "approve":
+        st.success("Suggestion approved and saved to the local audit database. No issue was closed or filed.")
+    elif decision_notice == "edit":
+        st.success("Edited suggestion saved to the local audit database. No issue was closed or filed.")
     st.subheader("Recent audit trail", icon=":material/history:")
     st.dataframe(store.recent_runs(client_id=client_id, limit=30), width="stretch", hide_index=True)
+    st.subheader("Approved draft issues", icon=":material/task_alt:")
+    approved_drafts = store.approved_drafts(client_id=history_client, limit=50)
+    if not approved_drafts:
+        st.info(f"No approved or edited drafts are recorded for {history_client} yet.")
+    else:
+        for item in approved_drafts:
+            approved_suggestion = item["suggestion"]
+            escaped_title = item["title"].replace("\\", "\\\\").replace("[", "\\[").replace("]", "\\]")
+            issue_link = f"?approved_draft={quote(item['approval_id'], safe='')}"
+            st.markdown(f"[{escaped_title}]({issue_link})")
+            decision_label = "Approved" if item["decision"] == "approve" else "Approved with edits"
+            st.caption(
+                f"{item['audit_id']} · {decision_label} · "
+                f"Severity: {approved_suggestion.get('severity', {}).get('value', 'Not recorded')} · "
+                f"Control: {approved_suggestion.get('control_mapping', {}).get('value', 'Not recorded')} · "
+                f"Approver: {item['approver']} · {item['decided_at']}"
+            )
+            st.divider()
+
+        requested_approval_id = st.query_params.get("approved_draft")
+        if requested_approval_id:
+            selected_draft = next(
+                (item for item in approved_drafts if item["approval_id"] == requested_approval_id),
+                None,
+            )
+            st.query_params.pop("approved_draft", None)
+            if selected_draft:
+                render_approved_draft_dialog(selected_draft)
 
 with tab_scope:
     with st.container(border=True):
         st.subheader("Plan RAU testing", icon=":material/account_tree:")
-        st.caption("Scoping is centered on the RAU and can use precedent from other audits. Client, audit, control, period, RAU name, and attributes are optional refinements.")
+        st.caption("Scoping is centered on the RAU and can use precedent from other audits. Select a synthetic client to keep retrieval within that client; audit, control, period, RAU name, and attributes are optional refinements. An entered audit period is included in semantic and keyword search.")
         with st.form("scope_intake"):
-            scope_client_choice = st.selectbox("Synthetic client (optional)", ["Any synthetic client", "synthetic-client-a", "synthetic-client-b"], key="scope_client")
+            scope_client_choice = st.selectbox("Synthetic client *", ["Select a synthetic client", "synthetic-client-a", "synthetic-client-b"], key="scope_client")
             scope_audit_choice = st.selectbox("Audit context (optional)", ["Not specified", "synthetic-audit-iam-2026", "synthetic-audit-finance-2026"], key="scope_audit")
             rau_id = st.text_input("RAU ID", value="RAU-AC-01")
             rau_name = st.text_input("Risk assessable unit name (optional)", value="")
@@ -453,11 +487,13 @@ with tab_scope:
             scope_submit = st.form_submit_button("Build cited scoping pack", type="primary", width="stretch")
 
     if scope_submit:
-        scope_client = "" if scope_client_choice == "Any synthetic client" else scope_client_choice
+        scope_client = "" if scope_client_choice == "Select a synthetic client" else scope_client_choice
         scope_audit = "" if scope_audit_choice == "Not specified" else scope_audit_choice
         control_ids = list(dict.fromkeys(item.strip() for item in controls_in_scope.split(",") if item.strip()))
         scope_attributes = list(dict.fromkeys(item.strip() for item in attributes.split(",") if item.strip()))
-        if not rau_id.strip():
+        if not scope_client:
+            st.warning("Select a synthetic client to build the scoping pack.")
+        elif not rau_id.strip():
             st.warning("Enter a RAU ID to build the scoping pack.")
         else:
             scope_run_id = str(uuid.uuid4())
@@ -465,8 +501,6 @@ with tab_scope:
             query_parts = [f"RAU {rau_id.strip()}"]
             if rau_name.strip():
                 query_parts.append(rau_name.strip())
-            if period.strip():
-                query_parts.append(period.strip())
             if control_ids:
                 query_parts.append(f"controls: {', '.join(control_ids)}")
             if scope_attributes:
@@ -493,8 +527,32 @@ with tab_scope:
         rows = pack["rows"]
         decisions = scope_state.get("decisions", [])
         decisions_by_id = {item["cluster_id"]: item for item in decisions}
+        scope_chat_context = {
+            "mode": "RAU scoping",
+            "client_id": scope_state.get("client_id", ""),
+            "audit_id": scope_state.get("audit_id", ""),
+            "rau_id": pack.get("rau_id", ""),
+            "audit_period": pack.get("audit_period", ""),
+            "lookback_since": pack.get("lookback_since", ""),
+            "clusters": [
+                {"control_id": row["control_id"], "attribute": row["attribute"], "root_cause": row["root_cause"]}
+                for row in rows
+            ],
+        }
         st.divider()
-        st.caption(f"RAU {pack['rau_id']} · {pack['audit_period'] or 'Period not specified'} · lookback since {pack['lookback_since']} · run {active_scope['run_id']}")
+        if pack.get("audit_years"):
+            audit_filter_label = (
+                f"Audit-year filter: {', '.join(pack['audit_years'])} · "
+                f"{len(pack.get('audit_ids_searched') or [])} matching audit ID(s)"
+            )
+        elif pack.get("audit_period"):
+            audit_filter_label = f"Audit-period search term: {pack['audit_period']} · no year filter recognized"
+        else:
+            audit_filter_label = "Audit-year filter: none"
+        st.caption(
+            f"RAU {pack['rau_id']} · {audit_filter_label} · "
+            f"lookback since {pack['lookback_since']} · run {active_scope['run_id']}"
+        )
         render_retrieval_legend()
         for i, row in enumerate(rows):
             with st.container(border=True):
@@ -511,6 +569,8 @@ with tab_scope:
                     if cited:
                         with st.expander(f"Citation · {cited['source_id']} · {cited['title']}"):
                             st.caption(
+                                f"Source audit ID: {cited.get('audit_id') or 'Not recorded'} · "
+                                f"Scoping audit context: {scope_state.get('audit_id') or 'Not specified'} · "
                                 f"Chunk {cited['chunk_id']} · semantic similarity {cited.get('semantic_score', cited.get('score', 0)):.3f} · "
                                 f"BM25 keyword {cited.get('keyword_score', 0):.3f} · term overlap {cited.get('keyword_overlap', 0):.0%} · "
                                 f"RRF rank {cited.get('hybrid_score', 0):.5f}"
@@ -545,21 +605,7 @@ with tab_scope:
             with st.expander(f"Excluded issues older than lookback ({len(pack['excluded_older_issues'])})"):
                 for item in pack["excluded_older_issues"]:
                     st.write(f"{item['source_id']} · {item['issue_date']} · {item['title']}")
-        render_run_chat(
-            "scoping", active_scope["run_id"], pack["citation_sources"],
-            {
-                "mode": "RAU scoping",
-                "client_id": scope_state.get("client_id", ""),
-                "audit_id": scope_state.get("audit_id", ""),
-                "rau_id": pack.get("rau_id", ""),
-                "audit_period": pack.get("audit_period", ""),
-                "lookback_since": pack.get("lookback_since", ""),
-                "clusters": [
-                    {"control_id": row["control_id"], "attribute": row["attribute"], "root_cause": row["root_cause"]}
-                    for row in rows
-                ],
-            },
-        )
+        render_run_chat("scoping", active_scope["run_id"], pack["citation_sources"], scope_chat_context)
 
     st.subheader("Saved scoping runs", icon=":material/folder_open:")
     scope_history_choice = st.selectbox("History client", ["All synthetic clients", "synthetic-client-a", "synthetic-client-b"], key="scope_history_client")

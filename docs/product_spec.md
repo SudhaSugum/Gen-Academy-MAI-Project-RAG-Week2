@@ -31,7 +31,7 @@ Help an auditor assess a newly logged issue by retrieving relevant precedent, co
 ### RAU Scoping Mode
 
 - Synthetic client and audit, risk assessable unit (RAU), audit period, in-scope control IDs, and attributes to test.
-- A two-year lookback is applied to past issues across audits tied to the required RAU. Client and control are optional filters; older matching issues are shown separately as excluded from the current lookback. Audit is optional run context and does not restrict cross-audit precedent.
+- A two-year lookback is applied to past issues across audits tied to the required RAU. A synthetic client is required; control is an optional filter. When the audit period contains a four-digit year, issue, control, and policy retrieval is restricted to matching audit IDs for that client; the period is also included in semantic and keyword queries. Other period text is used as a query refinement. Older matching issues are shown separately as excluded from the current lookback. Audit is optional run context and does not otherwise restrict cross-audit precedent.
 
 ## Outputs
 
@@ -59,7 +59,7 @@ Help an auditor assess a newly logged issue by retrieving relevant precedent, co
 
 1. Validate required input and bind it to a synthetic client/audit context. Retrieve exact-audit duplicate candidates separately from same-client, cross-audit precedent.
 2. Recall only approved, client/auditor-scoped memory patterns when configured.
-3. Retrieve exact-audit duplicate candidates, same-client past-issue precedents, controls, and policies from separate Pinecone namespaces. Apply client and audit filters to duplicate candidates; scoping requires RAU and optionally applies client and control filters before ranking, with audit intentionally omitted there. Fuse Pinecone semantic results with BM25 keyword results using Reciprocal Rank Fusion (RRF), applying the same metadata filters to the local keyword corpus before lexical scoring.
+3. Retrieve exact-audit duplicate candidates, same-client past-issue precedents, controls, and policies from separate Pinecone namespaces. Apply client and audit filters to duplicate candidates; scoping requires both RAU and client and optionally applies control filters before ranking, with audit intentionally omitted there. Fuse Pinecone semantic results with BM25 keyword results using Reciprocal Rank Fusion (RRF), applying the same metadata filters to the local keyword corpus before lexical scoring.
 4. Generate a structured suggestion from retrieved evidence using the configured LangChain model.
 5. Validate each citation against retrieved chunk ID, source ID, source type where required, and exact quote. Allow one repair attempt; otherwise show insufficient evidence.
 6. Pause the LangGraph workflow for human review. Persist the decision and reviewer identity in the SQL audit trail.
